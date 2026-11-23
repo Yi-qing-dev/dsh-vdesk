@@ -1,0 +1,5 @@
+# @lws31/dsh-vdesk：虚拟桌面（fork 自 dsh-vdesktop）
+# sidecarCwd 留空时默认指向本包内的 sidecar/ 目录。
+- insert:
+    - id: vdesk
+      name: '@lws31/dsh-vdesk'

@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+
+# 开发辅助（本机决策工作区，不随仓库发布）
+.deepseek-brain/
+dsh-deepseek-brain-preset/
+.dshv/
+/tools/
+
+# Python
+**/__pycache__/
+*.pyc
+
+# 其他杂物
+*.log
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

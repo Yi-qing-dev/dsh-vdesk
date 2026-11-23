@@ -1,0 +1,526 @@
+/**
+ * VDesktopPanel 宿主 HTTP 帧数据面（大脑 f63445bf56e9 裁决）。
+ *
+ * 独立 node http 服务，127.0.0.1:8790 起 +1 探测到 8799，全占 fail fast。
+ * 端点：
+ *   GET  /vdesk/desktops            → desktop.list（面板下拉框 + 端口探测用）
+ *   GET  /vdesk/frame?desktop=X     → capture.shot(png,1280) 帧字节；黑帧 204
+ *   POST /vdesk/input               → input_event（帧坐标点击）
+ * CORS：仅精确匹配 webOrigin（不用 *）；OPTIONS 预检 204；所有响应带 CORS 头。
+ */
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdir, readFile, access } from 'node:fs/promises';
+import type { Provider } from './vbox/provider.js';
+import type { VDesktopConfig } from './config.js';
+import type { VdeskControl } from './control.js';
+
+interface FrameServerOptions {
+  supervisor: Provider;
+  control: VdeskControl;
+  cfg: Required<VDesktopConfig>;
+  log: (msg: string) => void;
+}
+
+const PORT_BASE_DEFAULT = 8790;
+
+export class FrameServer {
+  private constructor(
+    private server: http.Server,
+    private supervisor: Provider,
+    private control: VdeskControl,
+    private webOrigin: string,
+    private frameDir: string,
+    private log: (msg: string) => void,
+  ) {}
+
+  /** 探测端口并启动；全占则 fail fast（不降端口、不随机）。 */
+  static async start(opts: FrameServerOptions): Promise<FrameServer> {
+    const base = opts.cfg.framePort || PORT_BASE_DEFAULT;
+    const max = opts.cfg.framePortMax || base + 9;
+    const frameDir = opts.cfg.frameDir
+      ? path.resolve(opts.cfg.frameDir)
+      : path.join(os.tmpdir(), 'dshv', 'frames');
+    // 帧目录启动时建一次，不每请求建（大脑裁决）
+    await mkdir(frameDir, { recursive: true });
+
+    const fs = new FrameServer(null as unknown as http.Server, opts.supervisor, opts.control,
+      opts.cfg.webOrigin, frameDir, opts.log);
+    let lastErr: unknown = null;
+    for (let port = base; port <= max; port++) {
+      try {
+        fs.server = await fs.listenOne(port);
+        opts.log(`[dsh-vdesktop] frame server listening on 127.0.0.1:${port}`);
+        return fs;
+      } catch (e) {
+        lastErr = e;
+        if ((e as NodeJS.ErrnoException)?.code !== 'EADDRINUSE') throw e;
+      }
+    }
+    throw new Error(
+      `frame server: ports ${base}-${max} all in use (${String(lastErr)})`,
+    );
+  }
+
+  get port(): number {
+    return (this.server.address() as { port?: number } | null)?.port ?? 0;
+  }
+
+  close(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.server.close(error => error ? reject(error) : resolve());
+      this.server.closeAllConnections();
+    });
+  }
+
+  private listenOne(port: number): Promise<http.Server> {
+    return new Promise<http.Server>((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        this.dispatch(req, res).catch((e) => {
+          this.log(`[dsh-vdesktop] frame dispatch error: ${String(e)}`);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: String(e) }));
+          } else {
+            res.end();
+          }
+        });
+      });
+      server.requestTimeout = 15_000; // 防卡死连接堆积（大脑裁决）
+      server.once('error', (e: NodeJS.ErrnoException) => {
+        if (e.code === 'EADDRINUSE') {
+          server.close();
+          reject(e);
+        } else {
+          reject(e);
+        }
+      });
+      server.listen(port, '127.0.0.1');
+      server.once('listening', () => resolve(server));
+    });
+  }
+
+  // 跨域 fetch 只暴露 safelisted 响应头；帧/输入面的自定义头必须显式
+  // Expose，否则浏览器端 resp.headers.get('X-Frame-Width') = null →
+  // 客户端 0x0 + 黑屏（大脑 6eab42eb5c8a 确认主因）。服务端实际产出的
+  // 全部自定义头白名单（不产的头不加；X-Frame-Format 当前不产）。
+  private static readonly EXPOSE_HEADERS = [
+    'X-Frame-Width',
+    'X-Frame-Height',
+    'X-Source-Width',
+    'X-Source-Height',
+    'X-Channel',
+    'X-Total-Ms',
+    'X-Black',
+    'X-Black-Reason',
+    'X-Cursor-X',
+    'X-Cursor-Y',
+    'X-Cursor-Visible',
+  ].join(', ');
+
+  /**
+   * 允许的来源：显式配置的 webOrigin、Desktop 的 dsh-app:// 外壳，以及任意本地
+   * 回环端口。DSH Desktop 每次启动换随机端口，写死一个端口等于把面板锁死
+   * （浏览器侧全是 403，画面永远黑）。只放行 127.0.0.1/localhost，不放行 *。
+   */
+  private isAllowedOrigin(origin: string | undefined): boolean {
+    if (!origin) return false;
+    if (origin === 'dsh-app://app' || origin === this.webOrigin) return true;
+    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{2,5}$/.test(origin);
+  }
+
+  private corsHeaders(origin: string | undefined): Record<string, string> {
+    const h: Record<string, string> = {};
+    if (this.isAllowedOrigin(origin)) {
+      h['Access-Control-Allow-Origin'] = origin as string;
+      h['Vary'] = 'Origin';
+      h['Access-Control-Expose-Headers'] = FrameServer.EXPOSE_HEADERS;
+    }
+    return h;
+  }
+
+  private async dispatch(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const cors = this.corsHeaders(req.headers.origin);
+    if (req.headers.host !== `127.0.0.1:${this.port}` ||
+        (req.headers.origin !== undefined && !cors['Access-Control-Allow-Origin']) ||
+        (!req.headers.origin && req.headers['sec-fetch-site'] === 'cross-site')) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      Object.assign(cors, {
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Max-Age': '600',
+      });
+      res.writeHead(204, cors);
+      res.end();
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/vdesk/desktops') {
+      return this.handleDesktops(cors, res);
+    }
+    // 客户端轮询的唯一入口：生命周期 + 暂停原因 + 最近动作
+    if (req.method === 'GET' && url.pathname === '/vdesk/state') {
+      return this.handleState(cors, res);
+    }
+    // 人工接管控制面：pause / resume / stop
+    if (req.method === 'POST' && url.pathname === '/vdesk/control') {
+      return this.handleControl(req, cors, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/vdesk/frame') {
+      return this.handleFrame(url, cors, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/vdesk/input') {
+      return this.handleInput(req, cors, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/vdesk/processes') {
+      return this.handleProcesses(url, cors, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/vdesk/launch') {
+      return this.handleForward(req, cors, res, 'desktop.launch');
+    }
+    if (req.method === 'POST' && url.pathname === '/vdesk/activate') {
+      return this.handleForward(req, cors, res, 'desktop.activate');
+    }
+    if (req.method === 'POST' && url.pathname === '/vdesk/close_window') {
+      return this.handleForward(req, cors, res, 'desktop.close_window');
+    }
+    if (req.method === 'POST' && url.pathname === '/vdesk/close_desktop') {
+      return this.handleCloseDesktop(req, cors, res);
+    }
+    res.writeHead(404, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  }
+
+  private async handleDesktops(
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    try {
+      const r = await this.supervisor.call<{ desktops?: string[] }>('desktop.list', {});
+      const desktops = Array.isArray(r?.desktops) ? r.desktops : [];
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ desktops }));
+    } catch (e) {
+      res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+
+  private async handleFrame(
+    url: URL,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const desktop = url.searchParams.get('desktop');
+    if (!desktop) {
+      res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'desktop required' }));
+      return;
+    }
+    // desktop 名 slug：防路径穿越；resolve 后校验仍在帧目录下
+    const slug = desktop.replace(/[^A-Za-z0-9._-]/g, '_');
+    const dirResolved = path.resolve(this.frameDir);
+    const out = path.resolve(dirResolved, `vdesk-${slug}.png`);
+    if (!out.startsWith(dirResolved)) {
+      res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad desktop slug' }));
+      return;
+    }
+    let result: {
+      out?: string;
+      width?: number;
+      height?: number;
+      sourceWidth?: number;
+      sourceHeight?: number;
+      channel?: string;
+      black?: boolean;
+      blackInfo?: { reason?: string } | null;
+      timing?: Record<string, unknown>;
+    };
+    let cursorInfo: { x?: number; y?: number; visible?: boolean } = {};
+    try {
+      const c = await this.supervisor.call<{ x?: number; y?: number; visible?: boolean }>('capture.cursor', { desktop }, 3000);
+      if (c && typeof c.x === 'number' && typeof c.y === 'number') {
+        cursorInfo = { x: c.x, y: c.y, visible: c.visible !== false };
+      }
+    } catch { /* old sidecar without capture.cursor — hide cursor */ }
+    try {
+      result = await this.supervisor.call<typeof result>('capture.shot', {
+        desktop,
+        out,
+        fmt: 'png',
+        maxLongEdge: 1280,
+        // M7（用户裁决）：完整 Windows 桌面（壁纸+任务栏）为默认帧；
+        // 旧行为可用 ?channel=printwindow 请求
+        channel: url.searchParams.get('channel') || 'desktop',
+      }, 30_000);
+    } catch (e) {
+      res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+      return;
+    }
+    if (result.black) {
+      // 黑帧：204 无 body + 状态头（大脑 Flask 版同款语义）
+      res.writeHead(204, {
+        ...cors,
+        'Cache-Control': 'no-store',
+        'X-Black': '1',
+        'X-Black-Reason': String(result.blackInfo?.reason ?? ''),
+        'X-Cursor-X': String(cursorInfo.x ?? -1),
+        'X-Cursor-Y': String(cursorInfo.y ?? -1),
+        'X-Cursor-Visible': cursorInfo.visible ? '1' : '0',
+      });
+      res.end();
+      return;
+    }
+    const file = result.out ?? out;
+    if (!file) {
+      res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no frame on disk' }));
+      return;
+    }
+    let data: Buffer;
+    try {
+      data = await readFile(file);
+    } catch {
+      res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no frame on disk' }));
+      return;
+    }
+    const t = result.timing ?? {};
+    res.writeHead(200, {
+      ...cors,
+      'Content-Type': 'image/png',
+      'Content-Length': data.length,
+      'Cache-Control': 'no-store',
+      'X-Frame-Width': String(result.width ?? 0),
+      'X-Frame-Height': String(result.height ?? 0),
+      'X-Source-Width': String(result.sourceWidth || result.width || 0),
+      'X-Source-Height': String(result.sourceHeight || result.height || 0),
+      'X-Channel': String(result.channel ?? ''),
+      'X-Total-Ms': String(t.totalMs ?? 0),
+      'X-Cursor-X': String(cursorInfo.x ?? -1),
+      'X-Cursor-Y': String(cursorInfo.y ?? -1),
+      'X-Cursor-Visible': cursorInfo.visible ? '1' : '0',
+    });
+    res.end(data);
+  }
+
+  private async handleProcesses(
+    url: URL,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const desktop = url.searchParams.get('desktop');
+    if (!desktop) {
+      res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'desktop required' }));
+      return;
+    }
+    try {
+      const r = await this.supervisor.call<Record<string, unknown>>('desktop.processes', { desktop }, 15_000);
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r));
+    } catch (e) {
+      res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+  }
+  
+  /**
+   * 关闭桌面并把它从「活着」的列表里摘掉。
+   *
+   * sidecar 的 desktop.close 只杀进程、不断句柄，desktop.list 仍会返回它，
+   * 于是 phase 在 idle / running 之间抖动，客户端会把它当成新任务把面板弹回来
+   * （用户看到的就是"点了终止，过一会儿自己又出来"）。
+   * 这里 close 之后补一次记名 + 单桌面 sweep，保证真的消失。
+   */
+  private async handleCloseDesktop(
+    req: http.IncomingMessage,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    let body = '';
+    req.on('data', (c: string) => {
+      body += c;
+      if (body.length > 4096) req.destroy();
+    });
+    req.on('end', async () => {
+      let name = '';
+      try {
+        const parsed = JSON.parse(body || '{}') as { name?: string; desktop?: string };
+        name = String(parsed.name ?? parsed.desktop ?? '');
+      } catch {
+        res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      if (!name) {
+        res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'name required' }));
+        return;
+      }
+      let closed: unknown = null;
+      try {
+        closed = await this.supervisor.call('desktop.close', { name }, 20_000);
+      } catch (e) {
+        closed = { error: String(e) };
+      }
+      this.control.markClosed(name);
+      this.control.detach();
+      // 只剩它一个时顺手 sweep，真正把桌面销毁掉
+      try {
+        const l = await this.supervisor.call<{ desktops?: string[] }>('desktop.list', {}, 5_000);
+        const others = (l?.desktops ?? []).filter((d) => d !== name);
+        if (others.length === 0) await this.supervisor.call('desktop.sweep', {}, 10_000);
+      } catch {
+        /* 清理失败不影响关闭结果 */
+      }
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ closed: true, name, result: closed }));
+    });
+  }
+
+  private async handleForward(
+    req: http.IncomingMessage,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+    method: string,
+  ): Promise<void> {
+    let body = '';
+    req.on('data', (c: string) => {
+      body += c;
+      if (body.length > 65536) req.destroy();
+    });
+    req.on('end', async () => {
+      let params: Record<string, unknown>;
+      try {
+        params = JSON.parse(body || '{}');
+      } catch {
+        res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      try {
+        const r = await this.supervisor.call<Record<string, unknown>>(method, params, 20_000);
+        res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(r));
+      } catch (e) {
+        res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(e) }));
+      }
+    });
+  }
+  
+  private async handleState(
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    let desktops: string[] = [];
+    try {
+      const r = await this.supervisor.call<{ desktops?: string[] }>('desktop.list', {}, 5_000);
+      desktops = Array.isArray(r?.desktops) ? r.desktops : [];
+    } catch {
+      // sidecar 未起来 = 没有桌面；不让状态轮询把面板打成 500
+    }
+    res.writeHead(200, {
+      ...cors,
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify(this.control.snapshot(desktops)));
+  }
+
+  private async handleControl(
+    req: http.IncomingMessage,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    let body = '';
+    req.on('data', (c: string) => {
+      body += c;
+      if (body.length > 4096) req.destroy();
+    });
+    req.on('end', async () => {
+      let action: string;
+      try {
+        const parsed = JSON.parse(body || '{}') as { action?: string };
+        action = String(parsed.action ?? '');
+      } catch {
+        res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      switch (action) {
+        case 'pause':
+          this.control.pause('user');
+          break;
+        case 'conflict':
+          this.control.pause('conflict');
+          break;
+        case 'resume':
+          this.control.resume();
+          break;
+        case 'stop':
+          this.control.stop();
+          break;
+        case 'show':
+          // agent 主动把面板唤回来（用户点过「仅隐藏」）
+          this.control.note('show', '重新打开面板');
+          break;
+        default:
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `unknown action: ${action}` }));
+          return;
+      }
+      // 必须回真实桌面列表：回空数组会让客户端把 phase 算成 idle，面板当场消失
+      let desktops: string[] = [];
+      try {
+        const r = await this.supervisor.call<{ desktops?: string[] }>('desktop.list', {}, 5_000);
+        desktops = Array.isArray(r?.desktops) ? r.desktops : [];
+      } catch {
+        /* sidecar 不可用时按无桌面处理 */
+      }
+      this.log(`[dsh-vdesk] control ${action} → ${this.control.reason ?? 'running'}`);
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(this.control.snapshot(desktops)));
+    });
+  }
+
+  private async handleInput(
+    req: http.IncomingMessage,
+    cors: Record<string, string>,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    let body = '';
+    req.on('data', (c: string) => {
+      body += c;
+      if (body.length > 65_536) req.destroy();
+    });
+    req.on('end', async () => {
+      let params: Record<string, unknown>;
+      try {
+        params = JSON.parse(body || '{}');
+      } catch {
+        res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      try {
+        const r = await this.supervisor.call<Record<string, unknown>>('input_event', params, 15_000);
+        // 面板里的点击/输入是"人工操作"，单独标记，Agent 状态胶囊不会把它当成自己的动作
+        this.control.note('manual', String((params as { kind?: string }).kind ?? 'input'));
+        res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(r));
+      } catch (e) {
+        res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(e) }));
+      }
+    });
+  }
+}
